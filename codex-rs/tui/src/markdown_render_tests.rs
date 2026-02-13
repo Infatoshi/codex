@@ -3,6 +3,7 @@ use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::text::Text;
+use unicode_width::UnicodeWidthStr;
 
 use crate::markdown_render::render_markdown_text;
 use crate::markdown_render::render_markdown_text_with_width;
@@ -720,6 +721,7 @@ fn table_renders_box_drawing_with_alignment() {
             "│ Left │ Center │ Right │".to_string(),
             "├──────┼────────┼───────┤".to_string(),
             "│ a    │   bb   │   ccc │".to_string(),
+            "├──────┼────────┼───────┤".to_string(),
             "│ long │  mid   │     x │".to_string(),
             "└──────┴────────┴───────┘".to_string(),
         ]
@@ -729,7 +731,7 @@ fn table_renders_box_drawing_with_alignment() {
 #[test]
 fn table_keeps_structure_when_wrap_width_is_narrow() {
     let md = "| A | B |\n|:-:|--:|\n| wide content | 42 |\n";
-    let text = render_markdown_text_with_width(md, Some(8));
+    let text = render_markdown_text_with_width(md, Some(20));
     let lines: Vec<String> = text
         .lines
         .iter()
@@ -740,16 +742,37 @@ fn table_keeps_structure_when_wrap_width_is_narrow() {
                 .collect::<String>()
         })
         .collect();
-    assert_eq!(
-        lines,
-        vec![
-            "┌──────────────┬────┐".to_string(),
-            "│      A       │  B │".to_string(),
-            "├──────────────┼────┤".to_string(),
-            "│ wide content │ 42 │".to_string(),
-            "└──────────────┴────┘".to_string(),
-        ]
-    );
+    assert_eq!(lines.first().map(String::as_str), Some("┌─────────────┬────┐"));
+    assert_eq!(lines.last().map(String::as_str), Some("└─────────────┴────┘"));
+    assert!(lines.iter().all(|line| UnicodeWidthStr::width(line.as_str()) <= 20));
+    assert!(lines.iter().any(|line| line.contains("wide")));
+    assert!(lines.iter().any(|line| line.contains("content")));
+}
+
+#[test]
+fn table_wraps_long_cell_content_without_breaking_borders() {
+    let md = "| Rank | Excitement | Why it matters | 5-year outlook |\n|---:|---|---|---|\n| 1 | Very High | AI copilots are shifting from chat helpers to embedded teammates that can plan, execute, and verify real work across code, data, and operations. | Becomes default workflow layer in most knowledge jobs. |\n";
+    let text = render_markdown_text_with_width(md, Some(80));
+    let lines: Vec<String> = text
+        .lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.clone())
+                .collect::<String>()
+        })
+        .collect();
+
+    assert_eq!(lines.iter().filter(|line| line.starts_with('┌')).count(), 1);
+    assert_eq!(lines.iter().filter(|line| line.starts_with('└')).count(), 1);
+    assert!(lines.iter().any(|line| line.starts_with('├')));
+    assert!(lines.iter().all(|line| line.starts_with('│') || line.starts_with('┌') || line.starts_with('├') || line.starts_with('└')));
+    assert!(lines.iter().all(|line| line.ends_with('│') || line.ends_with('┐') || line.ends_with('┤') || line.ends_with('┘')));
+    assert!(lines.iter().all(|line| UnicodeWidthStr::width(line.as_str()) <= 80));
+    let joined = lines.join(" ");
+    assert!(joined.contains("embedded"));
+    assert!(joined.contains("knowledge"));
 }
 
 #[test]

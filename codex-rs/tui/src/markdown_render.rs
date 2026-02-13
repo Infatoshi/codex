@@ -555,19 +555,19 @@ where
             }
         }
 
+        if let Some(max_width) = self.wrap_width {
+            let prefix_width = Self::span_width(&self.prefix_spans(false));
+            let available_width = max_width.saturating_sub(prefix_width);
+            column_widths = Self::fit_table_to_width(&column_widths, available_width);
+        }
+
         self.push_unwrapped_line(Self::table_border_line('┌', '┬', '┐', &column_widths));
 
-        let separator_after = if table.header_rows > 0 {
-            table.header_rows
-        } else if table.rows.len() > 1 {
-            1
-        } else {
-            0
-        };
-
         for (idx, row) in table.rows.iter().enumerate() {
-            self.push_unwrapped_line(Self::table_row_line(row, &column_widths, &table.alignments));
-            if separator_after > 0 && idx + 1 == separator_after && idx + 1 < table.rows.len() {
+            for line in Self::table_row_lines(row, &column_widths, &table.alignments) {
+                self.push_unwrapped_line(line);
+            }
+            if idx + 1 < table.rows.len() {
                 self.push_unwrapped_line(Self::table_border_line('├', '┼', '┤', &column_widths));
             }
         }
@@ -654,6 +654,96 @@ where
         }
         spans.push(right.to_string().into());
         Line::from(spans)
+    }
+
+    fn fit_table_to_width(column_widths: &[usize], max_table_width: usize) -> Vec<usize> {
+        if column_widths.is_empty() {
+            return Vec::new();
+        }
+
+        let target: Vec<usize> = column_widths.iter().map(|w| (*w).max(1)).collect();
+        if Self::table_line_width(&target) <= max_table_width {
+            return target;
+        }
+
+        let column_count = target.len();
+        let frame_width = 3 * column_count + 1;
+        if max_table_width <= frame_width {
+            return vec![1; column_count];
+        }
+        let content_budget = max_table_width - frame_width;
+
+        let mut fitted = vec![1usize; column_count];
+        let mut remaining = content_budget.saturating_sub(column_count);
+        while remaining > 0 {
+            let mut progressed = false;
+            for idx in 0..column_count {
+                if fitted[idx] < target[idx] {
+                    fitted[idx] += 1;
+                    remaining -= 1;
+                    progressed = true;
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        fitted
+    }
+
+    fn table_line_width(column_widths: &[usize]) -> usize {
+        1 + column_widths.iter().sum::<usize>() + 3 * column_widths.len()
+    }
+
+    fn table_row_lines(
+        row: &[Vec<Span<'static>>],
+        column_widths: &[usize],
+        alignments: &[Alignment],
+    ) -> Vec<Line<'static>> {
+        let wrapped_cells: Vec<Vec<Vec<Span<'static>>>> = column_widths
+            .iter()
+            .enumerate()
+            .map(|(column_idx, width)| {
+                let cell = row.get(column_idx).cloned().unwrap_or_default();
+                Self::wrap_table_cell(&cell, *width)
+            })
+            .collect();
+
+        let row_height = wrapped_cells.iter().map(Vec::len).max().unwrap_or(1);
+        let mut row_lines = Vec::with_capacity(row_height);
+        for line_idx in 0..row_height {
+            let cell_line_content: Vec<Vec<Span<'static>>> = wrapped_cells
+                .iter()
+                .map(|cell_lines| cell_lines.get(line_idx).cloned().unwrap_or_default())
+                .collect();
+            row_lines.push(Self::table_row_line(
+                &cell_line_content,
+                column_widths,
+                alignments,
+            ));
+        }
+
+        row_lines
+    }
+
+    fn wrap_table_cell(cell: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+        if cell.is_empty() {
+            return vec![Vec::new()];
+        }
+
+        let cell_line = Line::from(cell.to_vec());
+        let wrapped = word_wrap_line(&cell_line, RtOptions::new(width.max(1)));
+        if wrapped.is_empty() {
+            vec![Vec::new()]
+        } else {
+            wrapped
+                .into_iter()
+                .map(|line| line_to_static(&line).spans)
+                .collect()
+        }
     }
 
     fn table_row_line(

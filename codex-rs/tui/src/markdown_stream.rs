@@ -1,3 +1,8 @@
+use pulldown_cmark::Event;
+use pulldown_cmark::Options;
+use pulldown_cmark::Parser;
+use pulldown_cmark::Tag;
+use pulldown_cmark::TagEnd;
 use ratatui::text::Line;
 
 use crate::markdown;
@@ -40,6 +45,29 @@ impl MarkdownStreamCollector {
         } else {
             return Vec::new();
         };
+
+        // Tables are width-sensitive in our renderer. As more rows stream in, previously rendered
+        // table lines can change width. Since streamed history lines are append-only, defer
+        // emitting a trailing table block until finalize (or until a later non-table block closes
+        // it) so we never commit unstable table lines.
+        let defer_start = match (
+            trailing_table_start(&source),
+            trailing_table_header_candidate_start(&source),
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let source = if let Some(defer_start) = defer_start {
+            source[..defer_start].to_string()
+        } else {
+            source
+        };
+        if source.is_empty() {
+            return Vec::new();
+        }
+
         let mut rendered: Vec<Line<'static>> = Vec::new();
         markdown::append_markdown(&source, self.width, &mut rendered);
         let mut complete_line_count = rendered.len();
@@ -93,6 +121,59 @@ impl MarkdownStreamCollector {
         // Reset collector state for next stream.
         self.clear();
         out
+    }
+}
+
+fn trailing_table_start(source: &str) -> Option<usize> {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+
+    let mut stack: Vec<usize> = Vec::new();
+    let mut last_table: Option<(usize, usize)> = None;
+    for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Table(_)) => stack.push(range.start),
+            Event::End(TagEnd::Table) => {
+                if let Some(start) = stack.pop() {
+                    last_table = Some((start, range.end));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let (start, end) = last_table?;
+    let source_end = source.len();
+    let source_trimmed_end = source.trim_end_matches('\n').len();
+    if end == source_end || end == source_trimmed_end {
+        Some(start)
+    } else {
+        None
+    }
+}
+
+fn trailing_table_header_candidate_start(source: &str) -> Option<usize> {
+    if source.trim().is_empty() || source.ends_with("\n\n") {
+        return None;
+    }
+
+    let mut line_start = 0usize;
+    let mut last_non_empty: Option<(usize, &str)> = None;
+    for segment in source.split_inclusive('\n') {
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        if !line.trim().is_empty() {
+            last_non_empty = Some((line_start, line));
+        }
+        line_start += segment.len();
+    }
+
+    let (start, line) = last_non_empty?;
+    let trimmed = line.trim();
+    let pipe_count = trimmed.matches('|').count();
+    if trimmed.starts_with('|') && trimmed.ends_with('|') && pipe_count >= 2 {
+        Some(start)
+    } else {
+        None
     }
 }
 
@@ -666,5 +747,75 @@ mod tests {
             "more stuff\n",
         ])
         .await;
+    }
+
+    fn simulate_stream_markdown_with_width_for_tests(
+        deltas: &[&str],
+        width: Option<usize>,
+        finalize: bool,
+    ) -> Vec<Line<'static>> {
+        let mut collector = MarkdownStreamCollector::new(width);
+        let mut out = Vec::new();
+        for d in deltas {
+            collector.push_delta(d);
+            if d.contains('\n') {
+                out.extend(collector.commit_complete_lines());
+            }
+        }
+        if finalize {
+            out.extend(collector.finalize_and_drain());
+        }
+        out
+    }
+
+    async fn assert_streamed_equals_full_with_width(deltas: &[&str], width: Option<usize>) {
+        let streamed = simulate_stream_markdown_with_width_for_tests(deltas, width, true);
+        let streamed_strs = lines_to_plain_strings(&streamed);
+        let full: String = deltas.iter().copied().collect();
+        let mut rendered: Vec<ratatui::text::Line<'static>> = Vec::new();
+        crate::markdown::append_markdown(&full, width, &mut rendered);
+        let rendered_strs = lines_to_plain_strings(&rendered);
+        assert_eq!(streamed_strs, rendered_strs, "full:\n---\n{full}\n---");
+    }
+
+    #[tokio::test]
+    async fn table_streaming_with_wrap_width_matches_full_render() {
+        let deltas = [
+            "| Rank | Excitement | Why it matters | 5-year outlook |\n",
+            "|---|---|---|---|\n",
+            "| 1 | Very high | Agentic AI that can plan, call tools, and execute multi-step workflows is shifting software from assistive chat to delegated work. | Becomes a default layer in enterprise tooling, with strong gains where auditability and human-in-the-loop controls are mature. |\n",
+            "| 2 | High | AI-native developer platforms (codegen, test synthesis, automated review, refactoring copilots) directly impact delivery speed and reliability. | Moves from pair-programming to pipeline orchestration, with measurable productivity and defect-rate improvements. |\n",
+            "| 3 | High | Robotics plus foundation models unlock more adaptable automation in warehouses, labs, and field operations. | Practical deployment grows in constrained environments first; broad general-purpose autonomy remains gradual. |\n",
+            "| 4 | Medium-high | Personalized medicine using multimodal data (genomics, imaging, longitudinal records) can improve targeting of treatments and early risk detection. | Strong growth in decision support and stratification; full clinical integration depends on regulation and evidence quality. |\n",
+            "| 5 | Medium | Grid tech and energy storage innovation matter because AI compute, electrification, and climate pressure all converge on power availability. | Steady expansion of storage and smarter grid controls; regional policy and permitting remain key bottlenecks. |\n",
+        ];
+        assert_streamed_equals_full_with_width(&deltas, Some(90)).await;
+    }
+
+    #[tokio::test]
+    async fn trailing_table_is_deferred_until_finalize() {
+        let mut c = super::MarkdownStreamCollector::new(Some(90));
+
+        c.push_delta("Intro\n");
+        let intro = c.commit_complete_lines();
+        assert_eq!(lines_to_plain_strings(&intro), vec!["Intro".to_string()]);
+
+        c.push_delta("| A | B |\n");
+        assert!(c.commit_complete_lines().is_empty());
+
+        c.push_delta("|---|---|\n");
+        assert!(c.commit_complete_lines().is_empty());
+
+        c.push_delta("| row one with longer text | value |\n");
+        assert!(c.commit_complete_lines().is_empty());
+
+        c.push_delta("| row two with even longer text that changes widths | another value |\n");
+        assert!(c.commit_complete_lines().is_empty());
+
+        let tail = c.finalize_and_drain();
+        let tail_lines = lines_to_plain_strings(&tail);
+        assert!(!tail_lines.is_empty());
+        assert!(tail_lines.iter().any(|line| line.starts_with('┌')));
+        assert!(tail_lines.iter().any(|line| line.starts_with('└')));
     }
 }
